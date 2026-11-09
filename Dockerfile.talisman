@@ -1,0 +1,40 @@
+# Copyright 2025 - 2026 Zigflow authors <https://github.com/zigflow/zigflow/graphs/contributors>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build on the native platform, then cross-compile for the selected runtime.
+FROM --platform=$BUILDPLATFORM golang:1.26.4@sha256:f96cc555eb8db430159a3aa6797cd5bae561945b7b0fe7d0e284c63a3b291609 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG GIT_COMMIT=unknown
+ARG VERSION=0.14.2-talisman.1
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=readonly \
+      -trimpath -buildvcs=false \
+      -ldflags="-X github.com/zigflow/zigflow/cmd.Version=$VERSION -X github.com/zigflow/zigflow/cmd.GitCommit=$GIT_COMMIT" \
+      -o /out/app .
+
+# Preserve the upstream runtime (including Node/Python), user and entrypoint.
+FROM ghcr.io/zigflow/zigflow:0.14.2@sha256:d2db8f05ddaa915ac2e16cdb56984f9a133687c7041fd276746f283b20acd10e
+ARG GIT_COMMIT=unknown
+ARG VERSION=0.14.2-talisman.1
+ENV GIT_COMMIT=$GIT_COMMIT VERSION=$VERSION
+LABEL org.opencontainers.image.source="https://github.com/talismanai/zigflow" \
+      org.opencontainers.image.revision=$GIT_COMMIT \
+      org.opencontainers.image.version=$VERSION
+COPY --from=builder --chown=1000:1000 /out/app /app/app
