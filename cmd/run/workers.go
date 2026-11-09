@@ -58,9 +58,13 @@ func runScheduleUpdates(
 	registrations []*workflowRegistration,
 	envvars map[string]any,
 ) error {
+	if len(registrations) == 0 {
+		return nil
+	}
+	updater := zigflow.NewScheduleUpdater(temporalClient.ScheduleClient())
 	for _, reg := range registrations {
 		log.Info().Str("workflow", reg.WorkflowType).Msg("Updating schedules")
-		if err := zigflow.UpdateSchedules(ctx, temporalClient, reg.Definition, envvars); err != nil {
+		if err := updater.Update(ctx, reg.Definition, envvars); err != nil {
 			return gh.FatalError{
 				Cause: err,
 				WithParams: func(l *zerolog.Event) *zerolog.Event {
