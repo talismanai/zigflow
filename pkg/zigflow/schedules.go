@@ -27,18 +27,47 @@ import (
 	"go.temporal.io/sdk/client"
 )
 
+// ScheduleUpdater reconciles a sequential batch of definitions against one
+// schedule listing. Create a new updater for every startup or reload. It is not
+// safe for concurrent use and must not be retained between reloads.
+type ScheduleUpdater struct {
+	client   client.ScheduleClient
+	existing map[string]struct{}
+}
+
+// NewScheduleUpdater prepares a batch updater. The first Update fetches the listing.
+func NewScheduleUpdater(scheduleClient client.ScheduleClient) *ScheduleUpdater {
+	return &ScheduleUpdater{client: scheduleClient}
+}
+
+// UpdateSchedules preserves the single-definition API for callers outside the
+// worker launcher. Batch callers should share one ScheduleUpdater instead.
 func UpdateSchedules(ctx context.Context, temporalClient client.Client, workflow *model.Workflow, envvars map[string]any) error {
+	return NewScheduleUpdater(temporalClient.ScheduleClient()).Update(ctx, workflow, envvars)
+}
+
+// Update preserves schedule replacement and removal for one definition.
+func (u *ScheduleUpdater) Update(ctx context.Context, workflow *model.Workflow, envvars map[string]any) error {
 	info, err := metadata.GetScheduleInfo(workflow, envvars)
 	if err != nil {
 		return fmt.Errorf("error getting schedule metadata: %w", err)
 	}
 
 	schedule := workflow.Schedule
-	scheduleClient := temporalClient.ScheduleClient()
+	if u.existing == nil {
+		existing, err := listScheduleIDs(ctx, u.client)
+		if err != nil {
+			return err
+		}
+		u.existing = existing
+	}
 
 	log.Info().Str("scheduleID", info.ID).Msg("Deleting old schedules")
-	if err := deleteOldSchedules(ctx, scheduleClient, info.ID); err != nil {
-		return err
+	if _, exists := u.existing[info.ID]; exists {
+		if err := u.client.GetHandle(ctx, info.ID).Delete(ctx); err != nil {
+			return fmt.Errorf("error deleting workflow schedule: %w", err)
+		}
+		delete(u.existing, info.ID)
 	}
 
 	if schedule == nil {
@@ -67,10 +96,11 @@ func UpdateSchedules(ctx context.Context, temporalClient client.Client, workflow
 	}
 
 	log.Info().Any("schedule", info).Msg("Creating schedule")
-	if _, err := scheduleClient.Create(ctx, opts); err != nil {
+	if _, err := u.client.Create(ctx, opts); err != nil {
 		return fmt.Errorf("error creating schedule: %w", err)
 	}
 
+	u.existing[info.ID] = struct{}{}
 	return nil
 }
 
@@ -101,28 +131,20 @@ func buildTemporalScheduleSpec(schedule model.Schedule) (*client.ScheduleSpec, e
 	}, nil
 }
 
-func deleteOldSchedules(ctx context.Context, scheduleClient client.ScheduleClient, scheduleID string) error {
-	// Always delete matching schedules
+// Fetch every page before modifying schedules. An incomplete listing must not
+// be used as a successful snapshot, and unrelated schedule IDs are left alone.
+func listScheduleIDs(ctx context.Context, scheduleClient client.ScheduleClient) (map[string]struct{}, error) {
 	schedules, err := scheduleClient.List(ctx, client.ScheduleListOptions{})
 	if err != nil {
-		return fmt.Errorf("error listing temporal schedules: %w", err)
+		return nil, fmt.Errorf("error listing temporal schedules: %w", err)
 	}
-
+	existing := make(map[string]struct{})
 	for schedules.HasNext() {
-		s, err := schedules.Next()
+		schedule, err := schedules.Next()
 		if err != nil {
-			return fmt.Errorf("unable to get schedule: %w", err)
+			return nil, fmt.Errorf("unable to get schedule: %w", err)
 		}
-
-		// Find and destroy the schedule
-		if s.ID == scheduleID {
-			handler := scheduleClient.GetHandle(ctx, s.ID)
-
-			if err := handler.Delete(ctx); err != nil {
-				return fmt.Errorf("error deleting workflow schedule: %w", err)
-			}
-		}
+		existing[schedule.ID] = struct{}{}
 	}
-
-	return nil
+	return existing, nil
 }
