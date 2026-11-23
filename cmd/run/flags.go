@@ -105,6 +105,11 @@ func registerContainerRuntimeFlags(cmd *cobra.Command, opts *runOptions) {
 }
 
 func registerRunFlags(cmd *cobra.Command, opts *runOptions) {
+	cmd.Flags().StringVar(
+		&opts.PprofListenAddress, "pprof-listen-address",
+		viper.GetString("pprof_listen_address"), "Loopback address for heap and goroutine profiles (empty disables the server)",
+	)
+
 	registerWorkflowSourceFlags(cmd, opts)
 	temporal.NewCobraOpts(cmd, opts.temporal)
 	registerVersioningFlags(cmd, opts)

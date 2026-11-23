@@ -68,6 +68,7 @@ type runOptions struct {
 	MaxConcurrentActivityExecutionSize     int
 	MaxConcurrentWorkflowTaskExecutionSize int
 	TaskQueueActivitiesPerSecond           float64
+	PprofListenAddress                     string
 	Validate                               bool
 	Watch                                  bool
 	WatchDebounce                          time.Duration
@@ -98,6 +99,12 @@ func runRunCmd(ctx context.Context, opts *runOptions) error {
 				Msg("Recovered from panic")
 		}
 	}()
+
+	profilingServer, err := startProfiling(ctx, opts.PprofListenAddress)
+	if err != nil {
+		return err
+	}
+	defer stopProfiling(profilingServer)
 
 	registrations, err := prepareRegistrations(opts)
 	if err != nil {
