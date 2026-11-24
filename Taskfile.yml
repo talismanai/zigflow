@@ -48,7 +48,7 @@ tasks:
         echo "Temporal address: $TEMPORAL_ADDRESS"
         echo "HTTP mock address: $ZIGGY_HTTP_MOCK"
 
-        go test -v -tags=e2e ./tests/e2e/...
+        go test -v -tags=e2e ./tests/e2e/... ./cmd/run
 
   # Example-local e2e tests: each example owns its dependencies through
   # Testcontainers, so any examples/<name>/e2e_test.go is picked up automatically

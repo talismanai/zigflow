@@ -50,6 +50,52 @@ var newWorker = worker.New
 // the arguments passed in, without registering a real workflow.
 var newWorkflow = zigflow.NewWorkflow
 
+var purgeStickyWorkflowCache = worker.PurgeStickyWorkflowCache
+
+// workerGeneration keeps the last successfully started catalogue for rollback.
+type workerGeneration struct {
+	workers       []worker.Worker
+	registrations []*workflowRegistration
+}
+
+// replaceWorkers owns every worker in the watch process. The SDK's sticky cache
+// is process-wide and must only be purged while ALL workers are stopped. Cached
+// executions otherwise retain stopped workers' registries and workflow builders.
+// Suspended executions resume by replaying their durable Temporal histories.
+func replaceWorkers(
+	temporalClient client.Client,
+	opts *runOptions,
+	envvars map[string]any,
+	current *workerGeneration,
+	registrations []*workflowRegistration,
+) (*workerGeneration, error) {
+	next, err := buildWorkersByTaskQueue(temporalClient, registrations, envvars, opts)
+	if err != nil {
+		return current, err
+	}
+
+	stopWorkerList(current.workers)
+	purgeStickyWorkflowCache()
+	started, startErr := startAllWorkers(next)
+	if startErr == nil {
+		return &workerGeneration{workers: started, registrations: registrations}, nil
+	}
+
+	// startAllWorkers stops partially started replacements. Clear their cache
+	// before rebuilding the last good catalogue; stopped workers cannot restart.
+	purgeStickyWorkflowCache()
+	restored, err := buildWorkersByTaskQueue(temporalClient, current.registrations, envvars, opts)
+	if err == nil {
+		started, err = startAllWorkers(restored)
+	}
+	if err != nil {
+		purgeStickyWorkflowCache()
+		return nil, fmt.Errorf("reload failed: %w; restoring previous workers failed: %w", startErr, err)
+	}
+	return &workerGeneration{workers: started, registrations: current.registrations},
+		fmt.Errorf("reload failed; previous catalogue restored: %w", startErr)
+}
+
 // runScheduleUpdates updates Temporal schedules for all workflow registrations
 // before any worker is started.
 func runScheduleUpdates(
@@ -97,10 +143,11 @@ func startAllWorkers(workers map[string]worker.Worker) ([]worker.Worker, error) 
 		w := workers[taskQueue]
 		log.Info().Str("task-queue", taskQueue).Msg("Starting worker")
 		if err := w.Start(); err != nil {
+			// Start can fail after pollers start (for example during SDK worker
+			// heartbeat registration). Stop this worker too before any cache purge.
+			w.Stop()
 			stopWorkers(started)
-			for _, created := range workers {
-				tasks.ForgetWorkerActivities(created)
-			}
+			forgetWorkerActivities(workers)
 			return nil, gh.FatalError{
 				Cause: err,
 				WithParams: func(l *zerolog.Event) *zerolog.Event {
@@ -132,12 +179,9 @@ func buildWorkersByTaskQueue(
 	workers := make(map[string]worker.Worker)
 	defer func() {
 		if buildErr != nil {
-			for _, w := range workers {
-				tasks.ForgetWorkerActivities(w)
-			}
+			forgetWorkerActivities(workers)
 		}
 	}()
-
 	for _, reg := range registrations {
 		w, ok := workers[reg.TaskQueue]
 		if !ok {
@@ -222,26 +266,6 @@ func buildWorkersByTaskQueue(
 	}
 
 	return workers, nil
-}
-
-// launchWorkers prepares registrations, builds workers, and starts them.
-// On any error it stops any workers that were partially started before returning.
-func launchWorkers(
-	temporalClient client.Client,
-	opts *runOptions,
-	envvars map[string]any,
-) ([]worker.Worker, error) {
-	registrations, err := prepareRegistrations(opts)
-	if err != nil {
-		return nil, err
-	}
-
-	workers, err := buildWorkersByTaskQueue(temporalClient, registrations, envvars, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	return startAllWorkers(workers)
 }
 
 // stopWorkers stops each worker and releases its activity registrations.
@@ -329,5 +353,12 @@ func waitForShutdown(ctx context.Context) {
 		log.Info().Msg("Received interrupt signal")
 	case <-ctx.Done():
 		log.Info().Msg("Context cancelled")
+	}
+}
+
+// forgetWorkerActivities also handles workers that were built but never started.
+func forgetWorkerActivities(workers map[string]worker.Worker) {
+	for _, w := range workers {
+		tasks.ForgetWorkerActivities(w)
 	}
 }
