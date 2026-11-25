@@ -12,34 +12,38 @@ stops every worker before starting replacements.
 
 ## Ownership before and after retirement
 
+### Before: one execution retains the catalogue
+
 ```mermaid
 flowchart TB
-  subgraph before[Before: one suspended execution retains the catalogue]
-    C1[Temporal sticky cache] --> E1[Suspended execution A]
-    E1 --> H1[Old task handler and registry]
-    H1 --> A1[Compiled function A]
-    H1 --> B1[Compiled function B]
-    H1 --> N1[All other compiled functions]
-    A1 --> DA1[Definition A and builders]
-    B1 --> DB1[Definition B and builders]
-    N1 --> DN1[Other definitions and builders]
-  end
-  subgraph after[After: old worker has stopped and its slots are cleared]
-    C2[Temporal sticky cache] --> E2[Suspended execution A]
-    E2 --> A2[Invocation owns compiled function A]
-    A2 --> DA2[Definition A and builders]
-    E2 --> H2[Old task handler and registry]
-    H2 --> S2[Small forwarding functions with empty slots]
-    DB2[Unused definitions B through N are collectible]
-    W2[Running replacement workers] --> NEW[New catalogue]
-  end
+  cache["Temporal sticky cache"] --> execution["Suspended execution A"]
+  execution --> registry["Old task handler and registry"]
+  registry --> own["Compiled function A"]
+  registry --> others["All other compiled functions"]
+  own --> definition["Definition A and its builders"]
+  others --> catalogue["Unrelated definitions and builders"]
   classDef retained fill:#fff0cc,stroke:#a16600,color:#332200
-  classDef released fill:#dcfce7,stroke:#15803d,color:#14532d
-  class DA1,DB1,DN1,DA2 retained
-  classDef active fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
-  class DB2 released
-  class NEW active
+  class definition,catalogue retained
 ```
+
+### After: retired registration slots are empty
+
+```mermaid
+flowchart TB
+  cache["Temporal sticky cache"] --> execution["Suspended execution A"]
+  execution --> own["Invocation owns compiled function A"]
+  own --> definition["Definition A and its builders"]
+  execution --> registry["Old task handler and registry"]
+  registry --> slots["Forwarding functions with empty slots"]
+  classDef retained fill:#fff0cc,stroke:#a16600,color:#332200
+  classDef detached fill:#dcfce7,stroke:#15803d,color:#14532d
+  class definition retained
+  class slots detached
+```
+
+**Unrelated definitions and builders can now be collected.** The suspended
+invocation retains only its own compiled workflow. Replacement workers own the
+new catalogue and remain running, as shown in the lifecycle diagram below.
 
 A registration slot contains one atomic pointer to a compiled function. The SDK
 receives a forwarding function created through its public registration API.
@@ -73,7 +77,7 @@ sequenceDiagram
   Watch->>New: Start every replacement task queue
   alt Build or any Start fails
     Watch->>New: Stop attempted workers and discard all replacement slots
-    Note over Old: Same workers keep running; no restart or rebuild
+    Note over Old: Same workers keep running without restart or rebuild
   else All replacements start
     Note over New: Replacements already polling
     Watch->>Old: Stop with the configured grace period
