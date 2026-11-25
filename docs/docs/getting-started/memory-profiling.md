@@ -110,3 +110,6 @@ Heap profiles identify allocation sites, not the references keeping objects
 alive. Compare several post-GC snapshots under similar load, alongside sticky
 cache size, goroutines, reloads and RSS. Go heap samples do not account for every
 resident page, native allocation, runtime overhead or container file cache.
+
+See [workflow reload memory retention](./reload-memory-retention.md) for the
+measured retention mechanism, regression test and reload tradeoffs.

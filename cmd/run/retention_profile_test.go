@@ -29,6 +29,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 )
 
 // TestWorkerRetentionProfile runs only when explicitly selected with -tags=profile.
@@ -63,11 +64,11 @@ do:
 `, i)
 		require.NoError(t, os.WriteFile(filepath.Join(directory, fmt.Sprintf("%04d.yaml", i)), []byte(definition), 0o600))
 	}
-	c, err := client.Dial(client.Options{HostPort: address, Namespace: "default"})
+	c, err := client.Dial(client.Options{HostPort: address, Namespace: client.DefaultNamespace})
 	require.NoError(t, err)
 	defer c.Close()
-	opts := &runOptions{DirectoryPath: directory, DirectoryGlob: "*.yaml"}
-	current, err := launchWorkers(c, opts, nil)
+	opts := &runOptions{DirectoryPath: directory, DirectoryGlob: testDirectoryGlob}
+	current, err := launchProfileWorkers(c, opts, nil)
 	require.NoError(t, err)
 	defer func() { stopWorkerList(current) }()
 	samples, err := outputRoot.Create("heap.csv")
@@ -90,10 +91,31 @@ do:
 	}
 	snapshot(0)
 	for cycle := 1; cycle <= 10; cycle++ {
-		next, err := launchWorkers(c, opts, nil)
+		next, err := launchProfileWorkers(c, opts, nil)
 		require.NoError(t, err)
 		stopWorkerList(current)
 		current = next
 		snapshot(cycle)
 	}
+}
+
+// launchProfileWorkers reproduces the original PR #1 registration-only lifecycle.
+// It prepares registrations, builds workers, and starts them.
+// On any error it stops any workers that were partially started before returning.
+func launchProfileWorkers(
+	temporalClient client.Client,
+	opts *runOptions,
+	envvars map[string]any,
+) ([]worker.Worker, error) {
+	registrations, err := prepareRegistrations(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	workers, err := buildWorkersByTaskQueue(temporalClient, registrations, envvars, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return startAllWorkers(workers)
 }

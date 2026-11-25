@@ -62,15 +62,16 @@ func isWatchableEvent(e fsnotify.Event) bool {
 // handleDebounce executes a reload cycle after the debounce timer fires.
 // It logs the changed files, attempts to rebuild workers, swaps them on success,
 // and always refreshes the watcher to recover inodes lost by rename-style saves.
-// It returns the updated current workers and a fresh (empty) changedFiles map.
+// It returns the current generation and a fresh (empty) changedFiles map.
+// Failed replacements leave the current generation running.
 func handleDebounce(
 	watcher *fsnotify.Watcher,
 	temporalClient client.Client,
 	opts *runOptions,
 	envvars map[string]any,
 	changedFiles map[string]struct{},
-	current []worker.Worker,
-) (nextWorkers []worker.Worker, remainingChanges map[string]struct{}) {
+	current *workerGeneration,
+) (nextWorkers *workerGeneration, remainingChanges map[string]struct{}) {
 	if len(changedFiles) == 0 {
 		return current, changedFiles
 	}
@@ -82,13 +83,14 @@ func handleDebounce(
 	sort.Strings(names)
 	log.Warn().Str("files", strings.Join(names, ", ")).Msg("Watch: reloading workers")
 
-	next, loadErr := launchWorkers(temporalClient, opts, envvars)
+	registrations, loadErr := prepareRegistrations(opts)
+	if loadErr == nil {
+		current, loadErr = replaceWorkers(temporalClient, opts, envvars, current, registrations)
+	}
 	if loadErr != nil {
-		log.Error().Err(loadErr).Msg("Watch: reload failed, keeping existing workers")
+		log.Error().Err(loadErr).Msg("Watch: reload failed, previous catalogue remains active")
 	} else {
-		stopWorkerList(current)
-		current = next
-		log.Info().Int("count", len(current)).Msg("Watch: workers reloaded successfully")
+		log.Info().Int("count", len(current.workers)).Msg("Watch: workers reloaded successfully")
 	}
 	if err := refreshWatcher(watcher, opts); err != nil {
 		log.Error().Err(err).Msg("Watch: failed to refresh file watches")
@@ -136,16 +138,20 @@ func refreshWatcher(w *fsnotify.Watcher, opts *runOptions) error {
 
 // runWatchMode watches files for changes and reloads workers on each change.
 // It blocks until ctx is cancelled or an interrupt signal is received.
-// On reload failure it logs the error and keeps the existing workers running
-// so the system is never left with zero workers.
+// Invalid replacements and startup failures leave existing workers running.
 func runWatchMode(
 	ctx context.Context,
 	files []string,
 	temporalClient client.Client,
 	opts *runOptions,
 	envvars map[string]any,
-	current []worker.Worker,
+	current *workerGeneration,
 ) error {
+	defer func() {
+		if current != nil {
+			stopWorkerList(current.workers)
+		}
+	}()
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("watch: create watcher: %w", err)
@@ -162,18 +168,21 @@ func runWatchMode(
 		Dur("debounce", opts.WatchDebounce).
 		Msg("Watch: watching workflow files for changes")
 
-	defer func() { stopWorkerList(current) }()
-
 	debounce := newStoppedTimer(opts.WatchDebounce)
+	defer debounce.Stop()
 
 	// List of changed files - use map to autodedupe
 	changedFiles := make(map[string]struct{})
 
+	interrupt := worker.InterruptCh()
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-worker.InterruptCh():
+		case <-interrupt:
 			log.Info().Msg("Watch: received interrupt signal")
 			return nil
 		case event, ok := <-watcher.Events:

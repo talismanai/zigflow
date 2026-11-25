@@ -24,7 +24,6 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.temporal.io/sdk/worker"
 )
 
 // ---- isWatchableEvent ----
@@ -257,17 +256,19 @@ func TestHandleDebounce_EmptyChangedFilesIsNoop(t *testing.T) {
 
 	// Use nil workers to prove no stop calls are attempted when changedFiles
 	// is empty (stopWorkerList would panic on a non-nil entry).
-	current := []worker.Worker(nil)
+	current := &workerGeneration{}
 	changedFiles := make(map[string]struct{})
 
-	next, remaining := handleDebounce(w, nil, &runOptions{Files: []string{p}, DirectoryGlob: testDirectoryGlob}, nil, changedFiles, current)
+	opts := &runOptions{Files: []string{p}, DirectoryGlob: testDirectoryGlob}
+	next, remaining := handleDebounce(w, nil, opts, nil, changedFiles, current)
 
 	assert.Equal(t, current, next, "worker slice must be unchanged when changedFiles is empty")
+	require.NoError(t, err)
 	assert.Empty(t, remaining)
 }
 
 func TestHandleDebounce_KeepsCurrentWorkersOnReloadFailure(t *testing.T) {
-	// When launchWorkers fails, the returned worker slice must equal the
+	// When preparation fails, the returned generation must equal the
 	// original and changedFiles must be cleared.
 	// We force a failure at the discoverWorkflowFiles stage by providing opts
 	// with no files and no directory, which returns "No workflow files found"
@@ -276,7 +277,7 @@ func TestHandleDebounce_KeepsCurrentWorkersOnReloadFailure(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = w.Close() }()
 
-	current := []worker.Worker(nil)
+	current := &workerGeneration{}
 	// Use any non-empty path as the changed-file key; the actual value is only
 	// used for logging in handleDebounce.
 	changedFiles := map[string]struct{}{"/some/workflow.yaml": {}}
@@ -286,6 +287,7 @@ func TestHandleDebounce_KeepsCurrentWorkersOnReloadFailure(t *testing.T) {
 	opts := &runOptions{DirectoryGlob: testDirectoryGlob}
 	next, remaining := handleDebounce(w, nil, opts, nil, changedFiles, current)
 
+	require.NoError(t, err)
 	assert.Empty(t, remaining, "changedFiles must be cleared regardless of reload outcome")
 	assert.Equal(t, current, next, "current workers must be unchanged when reload fails")
 }
