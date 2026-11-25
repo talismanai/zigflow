@@ -153,7 +153,7 @@ func runRunCmd(ctx context.Context, opts *runOptions) error {
 		}()
 
 		return runWatchMode(ctx, watchFiles, temporalClient, opts, envvars, &workerGeneration{
-			workers: startedWorkers, registrations: registrations,
+			workers: startedWorkers,
 		})
 	}
 

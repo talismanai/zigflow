@@ -260,7 +260,7 @@ func TestHandleDebounce_EmptyChangedFilesIsNoop(t *testing.T) {
 	changedFiles := make(map[string]struct{})
 
 	opts := &runOptions{Files: []string{p}, DirectoryGlob: testDirectoryGlob}
-	next, remaining, err := handleDebounce(w, nil, opts, nil, changedFiles, current)
+	next, remaining := handleDebounce(w, nil, opts, nil, changedFiles, current)
 
 	assert.Equal(t, current, next, "worker slice must be unchanged when changedFiles is empty")
 	require.NoError(t, err)
@@ -285,7 +285,7 @@ func TestHandleDebounce_KeepsCurrentWorkersOnReloadFailure(t *testing.T) {
 	// opts with no files: prepareRegistrations will fail before reaching
 	// buildWorkersByTaskQueue, so no Temporal client is needed.
 	opts := &runOptions{DirectoryGlob: testDirectoryGlob}
-	next, remaining, err := handleDebounce(w, nil, opts, nil, changedFiles, current)
+	next, remaining := handleDebounce(w, nil, opts, nil, changedFiles, current)
 
 	require.NoError(t, err)
 	assert.Empty(t, remaining, "changedFiles must be cleared regardless of reload outcome")

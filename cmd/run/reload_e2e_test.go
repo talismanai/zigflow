@@ -34,9 +34,12 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/serverlessworkflow/sdk-go/v3/model"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zigflow/zigflow/pkg/cloudevents"
+	"github.com/zigflow/zigflow/pkg/telemetry"
+	"github.com/zigflow/zigflow/pkg/zigflow/tasks"
 	"go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
@@ -45,6 +48,93 @@ import (
 // SDK sticky cache against a local Temporal server. Do not run in parallel: the
 // cache is process-wide. Every execution and task queue belongs only to this test.
 func TestReloadSuspendedWorkflows(t *testing.T) {
+	c := reloadTestClient(t)
+	defer c.Close()
+	queue := fmt.Sprintf("reload-regression-%d", time.Now().UnixNano())
+	opts := &runOptions{DirectoryPath: t.TempDir(), DirectoryGlob: testDirectoryGlob, GracefulShutdownTimeout: time.Second}
+	var current *workerGeneration
+	var directRuns, loopRuns []client.WorkflowRun
+	defer func() {
+		if current != nil {
+			stopWorkers(current.workers)
+		}
+		for _, run := range append(directRuns, loopRuns...) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = c.TerminateWorkflow(ctx, run.GetID(), run.GetRunID(), "reload regression cleanup")
+			cancel()
+		}
+	}()
+	watcher, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, watcher.Close()) }()
+	var used, unused []weak.Pointer[model.Workflow]
+	// Observe definitions at the registration boundary without keeping them alive.
+	originalWorkflow := newWorkflow
+	defer func() { newWorkflow = originalWorkflow }()
+	currentDefinitions := make(map[string]weak.Pointer[model.Workflow])
+	newWorkflow = func(w worker.Worker, definition *model.Workflow, env map[string]any, events *cloudevents.Events,
+		telemetry *telemetry.Telemetry, taskOpts *tasks.TaskOpts,
+	) error {
+		currentDefinitions[definition.Document.Name] = weak.Make(definition)
+		return originalWorkflow(w, definition, env, events, telemetry, taskOpts)
+	}
+	// Keep the normal SDK cache enabled throughout. There is no cache purge,
+	// including in cleanup: completion/eviction must release retired definitions.
+	for generation := range 4 {
+		writeReloadCatalogue(t, opts.DirectoryPath, queue, generation)
+		if current == nil {
+			current = startReloadTestGeneration(t, c, opts)
+		} else {
+			for name, ref := range currentDefinitions {
+				if name == "reload-unused" {
+					unused = append(unused, ref)
+				} else {
+					used = append(used, ref)
+				}
+			}
+			clear(currentDefinitions)
+			changed := map[string]struct{}{filepath.Join(opts.DirectoryPath, "unused.yaml"): {}}
+			previous := current
+			current, _ = handleDebounce(watcher, c, opts, nil, changed, current)
+			require.NotSame(t, previous, current, "reload must start a replacement")
+		}
+		require.Eventually(t, func() bool {
+			runtime.GC()
+			return liveReloadDefinitions(unused) == 0
+		}, 5*time.Second, 25*time.Millisecond, "retired registry must not pin unrelated definitions")
+		require.Equal(t, len(used), liveReloadDefinitions(used), "suspended executions must retain their own definitions")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		direct, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+			ID: fmt.Sprintf("%s-direct-%d", queue, generation), TaskQueue: queue,
+		}, "reload-hold", nil, nil)
+		require.NoError(t, err)
+		directRuns = append(directRuns, direct)
+		loop, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+			ID: fmt.Sprintf("%s-loop-%d", queue, generation), TaskQueue: queue,
+		}, "reload-loop", nil, nil)
+		cancel()
+		require.NoError(t, err)
+		loopRuns = append(loopRuns, loop)
+		waitReloadTimer(t, c, direct.GetID(), direct.GetRunID())
+		waitReloadTimer(t, c, loop.GetID()+"_for_0", "")
+		recordReloadHeap(t, generation, liveReloadDefinitions(used)+liveReloadDefinitions(unused), len(used)+len(unused))
+		t.Logf("retired used=%d/%d unrelated=%d/%d", liveReloadDefinitions(used), len(used), liveReloadDefinitions(unused), len(unused))
+	}
+	for i, run := range directRuns {
+		resumeReloadExecution(t, c, run, fmt.Sprintf("resume-%d", i))
+	}
+	for _, run := range loopRuns {
+		resumeReloadLoopExecution(t, c, run)
+	}
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return liveReloadDefinitions(used)+liveReloadDefinitions(unused) == 0
+	}, 10*time.Second, 25*time.Millisecond, "completed executions must release all retired definitions while replacements run")
+	t.Log("8 root and 8 child executions completed with exact outputs and no workflow task failures; all 9 retired definitions collected")
+}
+
+func reloadTestClient(t *testing.T) client.Client {
+	t.Helper()
 	address := os.Getenv("TEMPORAL_ADDRESS")
 	if address == "" {
 		address = "127.0.0.1:7233"
@@ -55,70 +145,45 @@ func TestReloadSuspendedWorkflows(t *testing.T) {
 		"reload regression must use a local test server")
 	c, err := client.Dial(client.Options{HostPort: address, Namespace: client.DefaultNamespace})
 	require.NoError(t, err)
-	defer c.Close()
-	queue := fmt.Sprintf("reload-regression-%d", time.Now().UnixNano())
-	opts := &runOptions{DirectoryPath: t.TempDir(), DirectoryGlob: testDirectoryGlob, GracefulShutdownTimeout: time.Second}
-	var current *workerGeneration
-	var runs []client.WorkflowRun
-	defer func() {
-		if current != nil {
-			stopWorkers(current.workers)
-		}
-		worker.PurgeStickyWorkflowCache()
-		for _, run := range runs {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = c.TerminateWorkflow(ctx, run.GetID(), run.GetRunID(), "reload regression cleanup")
-			cancel()
-		}
-	}()
-	watcher, err := fsnotify.NewWatcher()
-	require.NoError(t, err)
-	defer func() { require.NoError(t, watcher.Close()) }()
-	var retired []weak.Pointer[model.Workflow]
-	for generation := range 4 {
-		writeReloadCatalogue(t, opts.DirectoryPath, queue, generation)
-		if current == nil {
-			current = startReloadTestGeneration(t, c, opts)
-		} else {
-			for _, reg := range current.registrations {
-				retired = append(retired, weak.Make(reg.Definition))
-			}
-			changed := map[string]struct{}{filepath.Join(opts.DirectoryPath, "unused.yaml"): {}}
-			current, _, err = handleDebounce(watcher, c, opts, nil, changed, current)
-			require.NoError(t, err)
-		}
-		// Collection, not an RSS/byte threshold: even unused definitions from
-		// the retired catalogue must disappear while their executions remain open.
-		assert.Eventually(t, func() bool {
-			runtime.GC()
-			return liveReloadDefinitions(retired) == 0
-		}, 5*time.Second, 50*time.Millisecond, "retired catalogues must be collectible before signals arrive")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		run, runErr := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-			ID: fmt.Sprintf("%s-%d", queue, generation), TaskQueue: queue,
-		}, "reload-hold", nil, nil)
-		cancel()
-		require.NoError(t, runErr)
-		runs = append(runs, run)
-		require.Eventually(t, func() bool {
-			return reloadHistoryCounts(t, c, run)[enums.EVENT_TYPE_TIMER_STARTED] == 1
-		}, 10*time.Second, 50*time.Millisecond, "signal listener must be durably suspended")
-		recordReloadHeap(t, generation, liveReloadDefinitions(retired), len(retired))
-	}
-	for i, run := range runs {
-		resumeReloadExecution(t, c, run, fmt.Sprintf("resume-%d", i))
-	}
-	t.Logf("all %d suspended executions resumed with their original run IDs and exact signal payloads", len(runs))
+	return c
 }
 
-func writeReloadCatalogue(t *testing.T, directory, queue string, generation int) {
+func waitReloadTimer(t *testing.T, c client.Client, id, runID string) {
 	t.Helper()
-	definition := fmt.Sprintf(`document:
-  dsl: 1.0.0
-  taskQueue: %s
-  workflowType: reload-hold
-  version: 1.0.0
-do:
+	require.Eventually(t, func() bool {
+		return reloadHistoryCountsByID(t, c, id, runID)[enums.EVENT_TYPE_TIMER_STARTED] == 1
+	}, 20*time.Second, 25*time.Millisecond, "signal listener must be durably suspended")
+}
+
+func resumeReloadLoopExecution(t *testing.T, c client.Client, run client.WorkflowRun) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i := range 2 {
+		childID := fmt.Sprintf("%s_for_%d", run.GetID(), i)
+		waitReloadTimer(t, c, childID, "")
+		child := c.GetWorkflow(ctx, childID, "")
+		payload := fmt.Sprintf("child-%d", i)
+		require.NoError(t, c.SignalWorkflow(ctx, childID, "", "resume", payload))
+		var result map[string]any
+		require.NoError(t, child.Get(ctx, &result))
+		require.Equal(t, map[string]any{"received": payload}, result["output"])
+		require.Zero(t, reloadHistoryCounts(t, c, child)[enums.EVENT_TYPE_WORKFLOW_TASK_FAILED])
+	}
+	initialRunID := run.GetRunID()
+	var result map[string]any
+	require.NoError(t, run.Get(ctx, &result))
+	require.Equal(t, map[string]any{"completed": true}, result)
+	require.Equal(t, initialRunID, run.GetRunID())
+	require.Zero(t, reloadHistoryCounts(t, c, run)[enums.EVENT_TYPE_WORKFLOW_TASK_FAILED])
+}
+
+func writeReloadCatalogue(t *testing.T, dir, queue string, generation int) {
+	t.Helper()
+	header := func(name string) string {
+		return fmt.Sprintf("document:\n  dsl: 1.0.0\n  taskQueue: %s\n  workflowType: %s\n  version: 1.0.0\n", queue, name)
+	}
+	direct := header("reload-hold") + `do:
   - approval:
       metadata:
         timeout: 1h
@@ -131,21 +196,40 @@ do:
   - result:
       set:
         received: ${ $data.approval }
-`, queue)
-	require.NoError(t, os.WriteFile(filepath.Join(directory, "hold.yaml"), []byte(definition), 0o600))
-	unused := fmt.Sprintf(`document:
-  dsl: 1.0.0
-  taskQueue: %s
-  workflowType: reload-unused
-  version: 1.0.0
-  metadata:
-    payload: %s
+`
+	loop := header("reload-loop") + `do:
+  - iteration:
+      for:
+        in: ${ 2 }
+      do:
+        - approval:
+            metadata:
+              timeout: 1h
+            listen:
+              to:
+                one:
+                  with:
+                    id: resume
+                    type: signal
+        - result:
+            set:
+              received: ${ $data.approval }
+  - finish:
+      set:
+        completed: true
+`
+	// Also exercises per-task activity registration, the separate root fixed by PR1.
+	unused := header("reload-unused") + "  metadata:\n    payload: " + strings.Repeat(fmt.Sprintf("g%07d", generation), 1<<20) + `
 do:
-  - wait:
-      wait:
-        hours: 1
-`, queue, strings.Repeat(fmt.Sprintf("g%07d", generation), 1<<20))
-	require.NoError(t, os.WriteFile(filepath.Join(directory, "unused.yaml"), []byte(unused), 0o600))
+  - request:
+      call: http
+      with:
+        method: get
+        endpoint: https://example.invalid/
+`
+	for name, definition := range map[string]string{"hold.yaml": direct, "loop.yaml": loop, "unused.yaml": unused} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(definition), 0o600))
+	}
 }
 
 func startReloadTestGeneration(t *testing.T, c client.Client, opts *runOptions) *workerGeneration {
@@ -156,7 +240,7 @@ func startReloadTestGeneration(t *testing.T, c client.Client, opts *runOptions) 
 	require.NoError(t, err)
 	started, err := startAllWorkers(workers)
 	require.NoError(t, err)
-	return &workerGeneration{workers: started, registrations: registrations}
+	return &workerGeneration{workers: started}
 }
 
 //go:noinline
@@ -172,12 +256,21 @@ func liveReloadDefinitions(refs []weak.Pointer[model.Workflow]) int {
 
 func reloadHistoryCounts(t *testing.T, c client.Client, run client.WorkflowRun) map[enums.EventType]int {
 	t.Helper()
+	return reloadHistoryCountsByID(t, c, run.GetID(), run.GetRunID())
+}
+
+func reloadHistoryCountsByID(t *testing.T, c client.Client, id, runID string) map[enums.EventType]int {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	history := c.GetWorkflowHistory(ctx, run.GetID(), run.GetRunID(), false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	history := c.GetWorkflowHistory(ctx, id, runID, false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
 	counts := make(map[enums.EventType]int)
 	for history.HasNext() {
 		event, err := history.Next()
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return counts
+		}
 		require.NoError(t, err)
 		counts[event.GetEventType()]++
 	}
@@ -201,72 +294,77 @@ func recordReloadHeap(t *testing.T, generation, alive, total int) {
 	}
 }
 
-// A real rebuilt worker must replay a suspended execution even after replacement
-// startup fails. Stopped SDK workers cannot simply be started again.
+// Rollback retains the SAME running worker even if the failed replacement had
+// already started polling. It must release every failed catalogue registration.
 func TestReloadRollbackResumesSuspendedWorkflow(t *testing.T) {
-	address := os.Getenv("TEMPORAL_ADDRESS")
-	if address == "" {
-		address = "127.0.0.1:7233"
+	for _, afterStart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("after-pollers=%v", afterStart), func(t *testing.T) {
+			c := reloadTestClient(t)
+			defer c.Close()
+			queue := fmt.Sprintf("reload-rollback-%d", time.Now().UnixNano())
+			opts := &runOptions{DirectoryPath: t.TempDir(), DirectoryGlob: testDirectoryGlob, GracefulShutdownTimeout: time.Second}
+			writeReloadCatalogue(t, opts.DirectoryPath, queue, 0)
+			current := startReloadTestGeneration(t, c, opts)
+			defer func() { stopWorkers(current.workers) }()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: queue, TaskQueue: queue}, "reload-hold", nil, nil)
+			require.NoError(t, err)
+			defer func() {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cleanupCancel()
+				_ = c.TerminateWorkflow(cleanupCtx, run.GetID(), run.GetRunID(), "reload rollback cleanup")
+			}()
+			waitReloadTimer(t, c, run.GetID(), run.GetRunID())
+			previous := current
+			originalNewWorker := newWorker
+			defer func() { newWorker = originalNewWorker }()
+			created := 0
+			newWorker = func(c client.Client, queue string, opts worker.Options) worker.Worker {
+				created++
+				return &failStartReloadWorker{Worker: originalNewWorker(c, queue, opts), afterStart: afterStart}
+			}
+			writeReloadCatalogue(t, opts.DirectoryPath, queue, 1)
+			var failedDefinitions []weak.Pointer[model.Workflow]
+			current, failedDefinitions, err = attemptFailedReload(t, c, opts, current)
+			require.ErrorContains(t, err, "previous workers remain running")
+			require.Same(t, previous, current)
+			require.Equal(t, 1, created, "rollback must not rebuild or restart the old worker")
+			require.Eventually(t, func() bool {
+				runtime.GC()
+				return liveReloadDefinitions(failedDefinitions) == 0
+			}, 5*time.Second, 25*time.Millisecond, "failed replacement must release its catalogue")
+			resumeReloadExecution(t, c, run, "resumed-after-rollback")
+		})
 	}
-	host, _, err := net.SplitHostPort(address)
-	require.NoError(t, err)
-	require.Contains(t, []string{"127.0.0.1", "localhost", "::1", "0.0.0.0"}, host)
-	c, err := client.Dial(client.Options{HostPort: address, Namespace: client.DefaultNamespace})
-	require.NoError(t, err)
-	defer c.Close()
-	queue := fmt.Sprintf("reload-rollback-%d", time.Now().UnixNano())
-	opts := &runOptions{DirectoryPath: t.TempDir(), DirectoryGlob: testDirectoryGlob, GracefulShutdownTimeout: time.Second}
-	writeReloadCatalogue(t, opts.DirectoryPath, queue, 0)
-	current := startReloadTestGeneration(t, c, opts)
-	defer func() {
-		if current != nil {
-			stopWorkers(current.workers)
-		}
-		worker.PurgeStickyWorkflowCache()
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: queue, TaskQueue: queue}, "reload-hold", nil, nil)
-	require.NoError(t, err)
-	defer func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		_ = c.TerminateWorkflow(cleanupCtx, run.GetID(), run.GetRunID(), "reload rollback cleanup")
-	}()
-	require.Eventually(t, func() bool {
-		return reloadHistoryCounts(t, c, run)[enums.EVENT_TYPE_TIMER_STARTED] == 1
-	}, 10*time.Second, 50*time.Millisecond)
-
-	previous := current
-	originalNewWorker := newWorker
-	defer func() { newWorker = originalNewWorker }()
-	created := 0
-	newWorker = func(c client.Client, queue string, opts worker.Options) worker.Worker {
-		w := originalNewWorker(c, queue, opts)
-		created++
-		if created == 1 {
-			return &failStartReloadWorker{Worker: w}
-		}
-		return w
-	}
-	writeReloadCatalogue(t, opts.DirectoryPath, queue, 1)
-	registrations, err := prepareRegistrations(opts)
-	require.NoError(t, err)
-	current, err = replaceWorkers(c, opts, nil, current, registrations)
-	require.ErrorContains(t, err, "previous catalogue restored")
-	require.NotNil(t, current)
-	require.Equal(t, 2, created, "rollback must construct a fresh SDK worker")
-	require.Same(t, previous.registrations[0], current.registrations[0])
-	resumeReloadExecution(t, c, run, "resumed-after-rollback")
 }
 
-type failStartReloadWorker struct{ worker.Worker }
+//go:noinline
+func attemptFailedReload(t *testing.T, c client.Client, opts *runOptions, current *workerGeneration) (
+	*workerGeneration, []weak.Pointer[model.Workflow], error,
+) {
+	t.Helper()
+	registrations, err := prepareRegistrations(opts)
+	require.NoError(t, err)
+	refs := make([]weak.Pointer[model.Workflow], 0, len(registrations))
+	for _, reg := range registrations {
+		refs = append(refs, weak.Make(reg.Definition))
+	}
+	next, err := replaceWorkers(c, opts, nil, current, registrations)
+	return next, refs, err
+}
+
+type failStartReloadWorker struct {
+	worker.Worker
+	afterStart bool
+}
 
 func (w *failStartReloadWorker) Start() error {
-	if err := w.Worker.Start(); err != nil {
-		return err
+	if w.afterStart {
+		if err := w.Worker.Start(); err != nil {
+			return err
+		}
 	}
-	// Model an SDK startup error after pollers have already started.
 	return errors.New("injected replacement startup failure")
 }
 

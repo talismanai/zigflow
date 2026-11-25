@@ -50,18 +50,14 @@ var newWorker = worker.New
 // the arguments passed in, without registering a real workflow.
 var newWorkflow = zigflow.NewWorkflow
 
-var purgeStickyWorkflowCache = worker.PurgeStickyWorkflowCache
-
-// workerGeneration keeps the last successfully started catalogue for rollback.
+// workerGeneration identifies the workers owned by one successful catalogue build.
 type workerGeneration struct {
-	workers       []worker.Worker
-	registrations []*workflowRegistration
+	workers []worker.Worker
 }
 
-// replaceWorkers owns every worker in the watch process. The SDK's sticky cache
-// is process-wide and must only be purged while ALL workers are stopped. Cached
-// executions otherwise retain stopped workers' registries and workflow builders.
-// Suspended executions resume by replaying their durable Temporal histories.
+// replaceWorkers starts the complete replacement before retiring the old workers.
+// A failed build/start leaves the current generation running. Each retired worker
+// releases its own registration targets, without touching the shared sticky cache.
 func replaceWorkers(
 	temporalClient client.Client,
 	opts *runOptions,
@@ -73,27 +69,12 @@ func replaceWorkers(
 	if err != nil {
 		return current, err
 	}
-
-	stopWorkerList(current.workers)
-	purgeStickyWorkflowCache()
-	started, startErr := startAllWorkers(next)
-	if startErr == nil {
-		return &workerGeneration{workers: started, registrations: registrations}, nil
-	}
-
-	// startAllWorkers stops partially started replacements. Clear their cache
-	// before rebuilding the last good catalogue; stopped workers cannot restart.
-	purgeStickyWorkflowCache()
-	restored, err := buildWorkersByTaskQueue(temporalClient, current.registrations, envvars, opts)
-	if err == nil {
-		started, err = startAllWorkers(restored)
-	}
+	started, err := startAllWorkers(next)
 	if err != nil {
-		purgeStickyWorkflowCache()
-		return nil, fmt.Errorf("reload failed: %w; restoring previous workers failed: %w", startErr, err)
+		return current, fmt.Errorf("reload failed; previous workers remain running: %w", err)
 	}
-	return &workerGeneration{workers: started, registrations: current.registrations},
-		fmt.Errorf("reload failed; previous catalogue restored: %w", startErr)
+	stopWorkerList(current.workers)
+	return &workerGeneration{workers: started}, nil
 }
 
 // runScheduleUpdates updates Temporal schedules for all workflow registrations
@@ -129,8 +110,8 @@ func runScheduleUpdates(
 // startAllWorkers starts each worker in the map and returns the list of
 // successfully started workers. Workers are started in sorted task-queue order
 // so that startup sequence is deterministic regardless of map iteration order.
-// On failure it stops any workers that were already started before returning
-// the error, so the caller does not need to track partial state.
+// On failure it stops attempted workers and discards registrations on workers
+// that were never started, so the caller does not need to track partial state.
 func startAllWorkers(workers map[string]worker.Worker) ([]worker.Worker, error) {
 	taskQueues := make([]string, 0, len(workers))
 	for tq := range workers {
@@ -143,11 +124,9 @@ func startAllWorkers(workers map[string]worker.Worker) ([]worker.Worker, error) 
 		w := workers[taskQueue]
 		log.Info().Str("task-queue", taskQueue).Msg("Starting worker")
 		if err := w.Start(); err != nil {
-			// Start can fail after pollers start (for example during SDK worker
-			// heartbeat registration). Stop this worker too before any cache purge.
-			w.Stop()
-			stopWorkers(started)
-			forgetWorkerActivities(workers)
+			// Start may fail after pollers start. Stop every attempted worker,
+			// and release registrations on those not yet attempted as well.
+			discardWorkers(workers)
 			return nil, gh.FatalError{
 				Cause: err,
 				WithParams: func(l *zerolog.Event) *zerolog.Event {
@@ -179,7 +158,7 @@ func buildWorkersByTaskQueue(
 	workers := make(map[string]worker.Worker)
 	defer func() {
 		if buildErr != nil {
-			forgetWorkerActivities(workers)
+			discardWorkers(workers)
 		}
 	}()
 	for _, reg := range registrations {
@@ -215,7 +194,7 @@ func buildWorkersByTaskQueue(
 				}
 			}
 
-			w = newWorker(temporalClient, reg.TaskQueue, worker.Options{
+			w = &catalogueWorker{Worker: newWorker(temporalClient, reg.TaskQueue, worker.Options{
 				WorkflowTaskPollerBehavior:             pollerAutoscaler,
 				ActivityTaskPollerBehavior:             pollerAutoscaler,
 				NexusTaskPollerBehavior:                pollerAutoscaler,
@@ -225,7 +204,7 @@ func buildWorkersByTaskQueue(
 				TaskQueueActivitiesPerSecond:           opts.TaskQueueActivitiesPerSecond,
 				DeploymentOptions:                      deploymentOptions,
 				SysInfoProvider:                        sysinfo.SysInfoProvider(),
-			})
+			})}
 			workers[reg.TaskQueue] = w
 			log.Debug().Str("task-queue", reg.TaskQueue).Msg("Created worker for task queue")
 			taskActivities := tasks.ActivitiesList()
@@ -356,9 +335,15 @@ func waitForShutdown(ctx context.Context) {
 	}
 }
 
-// forgetWorkerActivities also handles workers that were built but never started.
-func forgetWorkerActivities(workers map[string]worker.Worker) {
-	for _, w := range workers {
-		tasks.ForgetWorkerActivities(w)
+// discardWorkers also handles catalogues that failed to build or start.
+// catalogueWorker.Stop does not call the SDK's Stop before a Start attempt.
+func discardWorkers(workers map[string]worker.Worker) {
+	queues := make([]string, 0, len(workers))
+	for queue := range workers {
+		queues = append(queues, queue)
+	}
+	sort.Strings(queues)
+	for _, queue := range queues {
+		stopWorkers([]worker.Worker{workers[queue]})
 	}
 }
